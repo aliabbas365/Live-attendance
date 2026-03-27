@@ -1,0 +1,10 @@
+opencv-python
+numpy
+pandas
+insightface
+torch
+torchvision
+tqdm
+tensorboardX
+easydict
+Pillow

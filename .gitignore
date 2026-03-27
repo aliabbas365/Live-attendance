@@ -1,0 +1,9 @@
+.ipynb_checkpoints/
+attendance_logs/
+snapshots/
+unknown_faces/
+embeddings/
+employees_structured/
+Ali/
+*.mp4
+test.jpg
