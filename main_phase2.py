@@ -618,6 +618,7 @@ class FastFacePipeline:
                 emp_id, name, conf = self.recognition_engine.identify(tr.embedding)
                 tr.emp_id, tr.name, tr.confidence = emp_id, name, conf
 
+
                 if name == "Unknown":
                     tr.liveness_checked = False
                     tr.is_spoof = False
@@ -636,20 +637,41 @@ class FastFacePipeline:
                 tr.liveness_checked = True
 
                 if liveness:
+                    tr.real_count += 1
+                    tr.spoof_count = 0
+                    tr.is_live = True
                     tr.is_spoof = False
 
-                    if not tr.logged_once:
+                    if tr.real_count >= 3:
                         tr.is_confirmed = True
-                        logged, event_type = self.logger.log_recognition(
-                            emp_id, name, conf, frame, tr.bbox
-                        )
-                        if logged:
-                            print(f"✅ {event_type}: {name} ({conf:.3f})")
-                        tr.logged_once = True
+
+                        if not tr.logged_once:
+                            logged, event_type = self.logger.log_recognition(
+                                emp_id, name, conf, frame, tr.bbox
+                            )
+                            if logged:
+                                print(f"CHECK_IN OK: {name} ({conf:.3f}) | real_count={tr.real_count}")
+                                tr.logged_once = True
+                    else:
+                        tr.is_confirmed = False
+                        print(f"Waiting for stable liveness for {name}: {tr.real_count}/3")
+
                 else:
-                    tr.is_spoof = True
+                    tr.spoof_count += 1
+                    tr.real_count = 0
+                    tr.is_live = False
                     tr.is_confirmed = False
-                    print(f"🚫 Spoof rejected for {name}")
+
+                    if tr.logged_once:
+                        tr.is_spoof = False
+                        continue
+
+                    if tr.spoof_count >= 3:
+                        tr.is_spoof = True
+                        print(f"Spoof rejected for {name} | spoof_count={tr.spoof_count}")
+                    else:
+                        tr.is_spoof = False
+                        print(f"Unstable liveness for {name}: spoof_count={tr.spoof_count}/3")
 
         annotated = self.draw(frame_filtered.copy(), scale)
         return annotated, frame_small
