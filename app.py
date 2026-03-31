@@ -8,23 +8,32 @@ app = Flask(__name__)
 latest_frame = None
 frame_lock = threading.Lock()
 
+
 def update_stream_from_pipeline():
     global latest_frame
 
-    from main_phase2 import pipeline_frame_generator
+    try:
+        from main_phase2 import pipeline_frame_generator
 
-    for frame in pipeline_frame_generator():
-        ret, jpeg = cv2.imencode(".jpg", frame)
-        if not ret:
-            continue
-        with frame_lock:
-            latest_frame = jpeg.tobytes()
+        for frame in pipeline_frame_generator():
+            ret, jpeg = cv2.imencode(".jpg", frame)
+            if not ret:
+                continue
+
+            with frame_lock:
+                latest_frame = jpeg.tobytes()
+
+    except Exception as e:
+        print(f"Pipeline thread crashed: {e}")
+
 
 def mjpeg_generator():
     global latest_frame
+
     while True:
         with frame_lock:
             frame = latest_frame
+
         if frame is None:
             time.sleep(0.05)
             continue
@@ -34,6 +43,7 @@ def mjpeg_generator():
             b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
         )
         time.sleep(0.01)
+
 
 @app.route("/")
 def index():
@@ -47,6 +57,7 @@ def index():
     </html>
     """
 
+
 @app.route("/video_feed")
 def video_feed():
     return Response(
@@ -54,8 +65,8 @@ def video_feed():
         mimetype="multipart/x-mixed-replace; boundary=frame"
     )
 
+
 if __name__ == "__main__":
     t = threading.Thread(target=update_stream_from_pipeline, daemon=True)
     t.start()
     app.run(host="0.0.0.0", port=8081, threaded=True)
-    
