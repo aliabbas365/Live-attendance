@@ -1,57 +1,70 @@
-from flask import Flask, Response
+from flask import Flask, Response, jsonify
 import cv2
-import threading
 import time
+
+import state
+from config import APP_HOST, APP_PORT, MJPEG_SLEEP_SECONDS
+from capture_service import ensure_capture_started
+from inference_service import ensure_inference_started
+
 
 app = Flask(__name__)
 
-latest_frame = None
-frame_lock = threading.Lock()
+
+# ------------------------------------------------------------
+# START PIPELINE (ONLY ONCE)
+# ------------------------------------------------------------
+def ensure_pipeline_started():
+    ensure_capture_started()
+    ensure_inference_started()
 
 
-def update_stream_from_pipeline():
-    global latest_frame
-
-    try:
-        from main_phase2 import pipeline_frame_generator
-
-        for frame in pipeline_frame_generator():
-            ret, jpeg = cv2.imencode(".jpg", frame)
-            if not ret:
-                continue
-
-            with frame_lock:
-                latest_frame = jpeg.tobytes()
-
-    except Exception as e:
-        print(f"Pipeline thread crashed: {e}")
-
-
+# ------------------------------------------------------------
+# MJPEG STREAM (DEBUG ONLY)
+# ------------------------------------------------------------
 def mjpeg_generator():
-    global latest_frame
+    last_frame = None
 
     while True:
-        with frame_lock:
-            frame = latest_frame
+        with state.result_lock:
+            frame = state.latest_result_frame
 
         if frame is None:
-            time.sleep(0.05)
+            time.sleep(0.01)
             continue
+
+        # encode to jpeg
+        ret, jpeg = cv2.imencode(".jpg", frame)
+        if not ret:
+            continue
+
+        frame_bytes = jpeg.tobytes()
+
+        # skip duplicate frames
+        if frame_bytes == last_frame:
+            time.sleep(MJPEG_SLEEP_SECONDS)
+            continue
+
+        last_frame = frame_bytes
 
         yield (
             b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
         )
-        time.sleep(0.01)
 
 
+# ------------------------------------------------------------
+# ROUTES
+# ------------------------------------------------------------
 @app.route("/")
 def index():
+    ensure_pipeline_started()
+
     return """
     <html>
-      <head><title>Live Detection</title></head>
+      <head><title>AI Face Recognition</title></head>
       <body style="margin:0;background:#111;text-align:center;">
-        <h2 style="color:white;">Live AI Detection</h2>
+        <h2 style="color:white;">Live AI Detection (Production Pipeline)</h2>
         <img src="/video_feed" style="max-width:95vw;max-height:90vh;border:2px solid #444;" />
       </body>
     </html>
@@ -60,13 +73,35 @@ def index():
 
 @app.route("/video_feed")
 def video_feed():
+    ensure_pipeline_started()
     return Response(
         mjpeg_generator(),
         mimetype="multipart/x-mixed-replace; boundary=frame"
     )
 
 
+@app.route("/health")
+def health():
+    with state.status_lock:
+        status = dict(state.latest_status)
+
+    return jsonify({
+        "status": status,
+        "events_count": len(state.latest_events),
+    })
+
+
+@app.route("/latest_events")
+def latest_events():
+    with state.status_lock:
+        events = list(state.latest_events)
+
+    return jsonify(events)
+
+
+# ------------------------------------------------------------
+# ENTRY
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    t = threading.Thread(target=update_stream_from_pipeline, daemon=True)
-    t.start()
-    app.run(host="0.0.0.0", port=8081, threaded=True)
+    ensure_pipeline_started()
+    app.run(host=APP_HOST, port=APP_PORT, threaded=True)

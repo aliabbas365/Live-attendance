@@ -1,4 +1,14 @@
-.ipynb_checkpoints/
+venv/
+__pycache__/
+*.pyc
+*.pkl
+embeddings/
+snapshots/
+attendance_logs/
+*.mp4
+*.avi
+*.log
+.env.ipynb_checkpoints/
 attendance_logs/
 snapshots/
 unknown_faces/

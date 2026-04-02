@@ -14,11 +14,15 @@ import numpy as np
 import pandas as pd
 from insightface.app import FaceAnalysis
 
+latest_raw_ts = 0.0
+latest_result_ts = 0.0
 # ------------------------------------------------------------
 # ENVIRONMENT SETTINGS
 # ------------------------------------------------------------
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;500000"
+)
 warnings.filterwarnings("ignore")
 
 try:
@@ -77,13 +81,19 @@ MIN_INTEROCULAR_RATIO = 0.18
 LOG_COOLDOWN_SECONDS = 300
 
 TARGET_WIDTH = 640
-DETECT_EVERY_N_FRAMES = 5
-RECOGNIZE_EVERY_N_FRAMES = 5
-MAX_NUM_FACES = 2
-TRACK_TTL = 15
+DETECT_EVERY_N_FRAMES = 12
+RECOGNIZE_EVERY_N_FRAMES = 16
+MAX_NUM_FACES = 1
+TRACK_TTL = 10
 
 SAVE_OUTPUT_VIDEO = False
 OUTPUT_VIDEO_PATH = BASE_DIR / "output_phase2.mp4"
+
+latest_raw_frame = None
+latest_result_frame = None
+
+raw_lock = threading.Lock()
+result_lock = threading.Lock()
 
 
 # ------------------------------------------------------------
@@ -111,6 +121,7 @@ def open_video_capture(src):
     """
     Opens video source.
     Uses FFMPEG for network streams / video files.
+    Tries to reduce RTSP buffering and latency.
     """
     if isinstance(src, str) and (
         src.startswith(("rtsp://", "http://", "https://"))
@@ -121,6 +132,13 @@ def open_video_capture(src):
         cap = cv2.VideoCapture(src)
 
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+
+    if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+        cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+
     return cap
 
 
@@ -164,7 +182,7 @@ def safe_tracker_box(bbox):
 class VideoStream:
     """
     Threaded video reader for RTSP / live camera streams.
-    Automatically reconnects when stream fails.
+    Automatically reconnects when stream fails or becomes stale.
     """
 
     def __init__(self, src):
@@ -174,7 +192,20 @@ class VideoStream:
         self.frame = None
         self.stopped = False
         self.lock = threading.Lock()
+
+        self.last_signature = None
+        self.same_frame_count = 0
+        self.max_same_frames = 30
+
         self._open_stream()
+
+    def _frame_signature(self, frame):
+        if frame is None:
+            return None
+
+        small = cv2.resize(frame, (32, 32))
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        return gray.tobytes()
 
     def _open_stream(self):
         if self.stream is not None:
@@ -185,37 +216,53 @@ class VideoStream:
 
         self.stream = open_video_capture(self.src)
         self.grabbed, self.frame = self.stream.read()
+
+        self.last_signature = self._frame_signature(self.frame)
+        self.same_frame_count = 0
+
         if self.grabbed:
             print("RTSP stream connected")
         else:
-            print("RTSP stream connection failed, retrying...")
+            print("RTSP stream connection failed, retrying...") 
 
     def start(self):
         threading.Thread(target=self.update, daemon=True).start()
         return self
 
     def update(self):
+        global latest_raw_frame
+    
         while not self.stopped:
             if self.stream is None or not self.stream.isOpened():
                 print("Stream closed. Reconnecting...")
                 time.sleep(2)
                 self._open_stream()
                 continue
-
-            grabbed, frame = self.stream.read()
-            if not grabbed or frame is None:
-                print("Frame read failed. Reconnecting RTSP...")
+    
+            grabbed = self.stream.grab()
+            if not grabbed:
+                print("Frame grab failed. Reconnecting RTSP...")
                 time.sleep(2)
                 self._open_stream()
                 continue
-
-            with self.lock:
-                self.grabbed = grabbed
-                self.frame = frame
-
+    
+            for _ in range(2):
+                self.stream.grab()
+    
+            ok, frame = self.stream.retrieve()
+            if not ok or frame is None:
+                print("Frame retrieve failed. Reconnecting RTSP...")
+                time.sleep(2)
+                self._open_stream()
+                continue
+    
+            with raw_lock:
+                latest_raw_frame = frame
+                            
     def read(self):
-        with self.lock:
-            return None if self.frame is None else self.frame.copy()
+            global latest_raw_frame
+            with raw_lock:
+                return None if latest_raw_frame is None else latest_raw_frame.copy()
 
     def stop(self):
         self.stopped = True
@@ -224,6 +271,24 @@ class VideoStream:
                 self.stream.release()
         except Exception:
             pass
+
+def inference_worker(pipeline):
+    global latest_raw_frame, latest_result_frame
+
+    while True:
+        with raw_lock:
+            frame = None if latest_raw_frame is None else latest_raw_frame.copy()
+
+        if frame is None:
+            time.sleep(0.01)
+            continue
+
+        annotated, _ = pipeline.process(frame)
+
+        if annotated is not None:
+            with result_lock:
+                latest_result_frame = annotated
+                latest_result_ts = time.time()
 
 
 # ------------------------------------------------------------
@@ -783,14 +848,7 @@ class FastFacePipeline:
         frame_small = cv2.resize(frame, (TARGET_WIDTH, int(h * scale)))
 
         # Contrast enhancement
-        lab = cv2.cvtColor(frame_small, cv2.COLOR_BGR2LAB)
-        l_channel, a_channel, b_channel = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        cl = clahe.apply(l_channel)
-        frame_filtered = cv2.cvtColor(
-            cv2.merge((cl, a_channel, b_channel)),
-            cv2.COLOR_LAB2BGR,
-        )
+        frame_filtered = frame_small
 
         # Detect every N frames
         if self.frame_index % DETECT_EVERY_N_FRAMES == 1:
@@ -880,28 +938,28 @@ class FastFacePipeline:
                     tr.spoof_count = 0
                     continue
 
-                liveness = self.anti_spoof.is_real(frame, tr.bbox)
+                if not tr.liveness_checked:
+                    liveness = self.anti_spoof.is_real(frame, tr.bbox)
 
-                if liveness is None:
-                    tr.liveness_checked = False
-                    tr.is_spoof = False
-                    tr.is_confirmed = False
-                    tr.is_live = False
-                    tr.real_count = 0
-                    tr.spoof_count = 0
-                    print(f"Liveness unavailable for {name}, skipping spoof decision")
-                    continue
+                    if liveness is None:
+                        tr.liveness_checked = False
+                        tr.is_spoof = False
+                        tr.is_confirmed = False
+                        tr.is_live = False
+                        tr.real_count = 0
+                        tr.spoof_count = 0
+                        print(f"Liveness unavailable for {name}, skipping spoof decision")
+                        continue
 
-                tr.liveness_checked = True
+                    tr.liveness_checked = True
 
-                if liveness:
-                    tr.real_count += 1
-                    tr.spoof_count = 0
-                    tr.is_live = True
-                    tr.is_spoof = False
-
-                    if tr.real_count >= 3:
+                    if liveness:
+                        tr.real_count = 1
+                        tr.spoof_count = 0
+                        tr.is_live = True
+                        tr.is_spoof = False
                         tr.is_confirmed = True
+
                         if not tr.logged_once:
                             logged, event_type = self.logger.log_recognition(
                                 emp_id,
@@ -911,35 +969,15 @@ class FastFacePipeline:
                                 tr.bbox,
                             )
                             if logged:
-                                print(
-                                    f"{event_type} OK: {name} ({conf:.3f}) "
-                                    f"| real_count={tr.real_count}"
-                                )
+                                print(f"{event_type} OK: {name} ({conf:.3f})")
                                 tr.logged_once = True
                     else:
-                        tr.is_confirmed = False
-                        print(f"Waiting for stable liveness for {name}: {tr.real_count}/3")
-
-                else:
-                    tr.spoof_count += 1
-                    tr.real_count = 0
-                    tr.is_live = False
-                    tr.is_confirmed = False
-
-                    if tr.logged_once:
-                        # If already logged as real once, do not mark later unstable results as spoof
-                        tr.is_spoof = False
-                        continue
-
-                    if tr.spoof_count >= 3:
+                        tr.real_count = 0
+                        tr.spoof_count = 1
+                        tr.is_live = False
                         tr.is_spoof = True
-                        print(f"Spoof rejected for {name} | spoof_count={tr.spoof_count}")
-                    else:
-                        tr.is_spoof = False
-                        print(
-                            f"Unstable liveness for {name}: "
-                            f"spoof_count={tr.spoof_count}/3"
-                        )
+                        tr.is_confirmed = False
+                        print(f"Spoof rejected for {name}") 
 
         annotated = self.draw(frame_filtered.copy(), scale)
         return annotated, frame_small
@@ -990,6 +1028,17 @@ class FastFacePipeline:
                 1,
             )
 
+            lag_ms = int((time.time() - latest_result_ts) * 1000) if latest_result_ts else 0
+            cv2.putText(
+                frame,
+                f"Lag: {lag_ms} ms",
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 0),
+                2,
+            )
+
         return frame
 
 
@@ -1007,12 +1056,14 @@ def build_runtime_pipeline():
         database,
         threshold=RECOGNITION_THRESHOLD,
     )
+    
     attendance_logger = AttendanceLogger(cooldown_seconds=LOG_COOLDOWN_SECONDS)
     anti_spoof_engine = AntiSpoofEngine(
         ANTI_SPOOF_MODEL_DIR,
         device_id=ANTI_SPOOF_DEVICE_ID,
     )
-
+    anti_spoof_engine.enabled = False
+    
     return FastFacePipeline(
         face_app,
         recognition_engine,
@@ -1090,66 +1141,80 @@ def start_recognition():
                     time.sleep(0.05)
                     continue
 
+                t0 = time.time()
                 annotated, _ = pipeline.process(frame)
+                dt_ms = (time.time() - t0) * 1000
+                    
                 if annotated is not None:
-                    print(f"Frame: {pipeline.frame_index}, tracks={len(pipeline.tracks)}")
+                    print(f"Frame: {pipeline.frame_index}, proc_ms={dt_ms:.1f}")
+                
 
         except KeyboardInterrupt:
             print("Stopped by user")
         finally:
             vs.stop()
+            
 
 
 # ------------------------------------------------------------
 # GENERATOR VERSION
 # ------------------------------------------------------------
 def pipeline_frame_generator():
-    """
-    Generator version for frameworks that want frame-by-frame output.
-    """
-    source = get_camera_source()
-    pipeline = build_runtime_pipeline()
-
-    source_str = str(source).lower()
-    is_video_file = source_str.endswith((".mp4", ".avi", ".mov", ".mkv"))
-
-    if is_video_file:
-        cap = open_video_capture(source)
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open video file: {source}")
-
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                annotated, _ = pipeline.process(frame)
-                if annotated is not None:
-                    yield annotated
-        finally:
-            cap.release()
-
-    else:
-        vs = VideoStream(source).start()
-        time.sleep(2.0)
-
-        try:
-            while True:
-                frame = vs.read()
-                if frame is None:
-                    time.sleep(0.05)
-                    continue
-
-                annotated, _ = pipeline.process(frame)
-                if annotated is not None:
-                    yield annotated
-        finally:
-            vs.stop()
-
+     """
+     Generator version for frameworks that want frame-by-frame output.
+     """
+     global latest_raw_frame, latest_result_frame
+ 
+     source = get_camera_source()
+     source_str = str(source).lower()
+     is_video_file = source_str.endswith((".mp4", ".avi", ".mov", ".mkv"))
+ 
+     if is_video_file:
+         pipeline = build_runtime_pipeline()
+         cap = open_video_capture(source)
+         
+         if not cap.isOpened():
+             raise RuntimeError(f"Could not open video file: {source}")
+ 
+         try:
+             while True:
+                 ret, frame = cap.read()
+                 if not ret:
+                     break
+ 
+                 annotated, _ = pipeline.process(frame)
+                 if annotated is not None:
+                     yield annotated
+         finally:
+             cap.release()
+ 
+     else:
+         with raw_lock:
+             latest_raw_frame = None
+         with result_lock:
+             latest_result_frame = None
+ 
+         vs = VideoStream(source).start()
+         time.sleep(2.0)
+ 
+         pipeline = build_runtime_pipeline()
+         threading.Thread(target=inference_worker, args=(pipeline,), daemon=True).start()
+ 
+         try:
+             while True:
+                 with result_lock:
+                     frame = None if latest_result_frame is None else latest_result_frame.copy()
+ 
+                 if frame is None:
+                     time.sleep(0.01)
+                     continue
+ 
+                 yield frame
+         finally:
+             vs.stop()
 
 # ------------------------------------------------------------
 # ENTRY POINT
 # ------------------------------------------------------------
-# if __name__ == "__main__":
-#     start_recognition()
+#if __name__ == "__main__":
+ #   start_recognition()
