@@ -4,7 +4,7 @@
 
 A production-style real-time face recognition system designed for low-latency inference using RTSP streams and GPU acceleration.
 
-## 🔧 Architecture
+##  Architecture
 
 RTSP Stream → Capture Thread → Inference Thread → API → UI
 
